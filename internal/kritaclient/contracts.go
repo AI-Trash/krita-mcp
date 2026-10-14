@@ -74,6 +74,8 @@ func makeContracts() map[string]*Schema {
 			"visible": nullable(flag), "blending_mode": nullable(blend), "preserve_alpha": nullable(flag),
 		}),
 		"set_active_layer": object(map[string]*Schema{"layer_id": nonempty}, "layer_id"),
+		"delete_layer":     object(map[string]*Schema{"layer_id": nonempty}, "layer_id"),
+		"merge_down":       object(map[string]*Schema{"layer_id": nonempty}, "layer_id"),
 		"select_rect":      rect, "select_ellipse": rect,
 		"select_polygon":  object(map[string]*Schema{"points": polygonPoints, "smooth": defaulted(flag, "false")}, "points"),
 		"select_by_alpha": object(map[string]*Schema{"threshold": defaulted(&Schema{Type: "integer", Minimum: pointer(1.0), Maximum: pointer(255.0)}, "1")}),
