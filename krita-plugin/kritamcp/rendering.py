@@ -1,8 +1,9 @@
 """Geometry for native painting; bounded offline polygon patches, never strokes.
 
-Coordinates stay in document space. Sampling uses <=2px chords and <=0.2px
+Coordinates stay in document space. Sampling uses <=4px chords and <=0.2px
 cubic deviation; pressure controls interpolate cubically for explicit Beziers,
 linearly between Catmull-Rom knots. Tapers are fractions of sampled arc length.
+Tapered spans longer than 2px retain an interior sample.
 Limits: 4096 controls, coordinates +/-1e9, 131072 samples, 4M raster pixels,
 32M feather channel visits. Requests exceeding a limit raise RenderError.
 SIZE_OK: the task's fixed single-module integration boundary owns these helpers.
@@ -28,6 +29,7 @@ Patch = tuple[int, int, int, int, bytes]
 Buffer: TypeAlias = "bytes | bytearray | memoryview | QByteArray"
 MAX_PIXELS: Final = 4_000_000
 MAX_SAMPLES: Final = 131_072
+MAX_CHORD: Final = 4
 MAX_WORK: Final = 32_000_000
 
 
@@ -144,13 +146,14 @@ def sample_stroke(points: Sequence[Sequence[float]], *, smooth: bool = True,
         while stack:
             (start, first, second, end), depth = stack.pop()
             chord = math.hypot(end[0] - start[0], end[1] - start[1])
-            if chord > 2 * (MAX_SAMPLES - 1):
+            if chord > MAX_CHORD * (MAX_SAMPLES - 1):
                 raise RenderError("Stroke exceeds spatial sampling budget")
             expected = (_mix(start, end, 1 / 3), _mix(start, end, 2 / 3))
             error = max(math.hypot(point[0] - linear[0], point[1] - linear[1])
                         for point, linear in zip((first, second), expected))
             pressure_error = max(abs(point[2] - linear[2]) for point, linear in zip((first, second), expected))
-            if chord <= 2 and error <= .2 and pressure_error <= .005:
+            chord_limit = 2 if depth == 0 and (begin or finish) else MAX_CHORD
+            if chord <= chord_limit and error <= .2 and pressure_error <= .005:
                 path.append(end)
             else:
                 if depth >= 28:

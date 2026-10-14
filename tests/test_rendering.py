@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "krita-plugin" / "kritamcp"))
 import rendering
@@ -13,6 +14,61 @@ QT_AVAILABLE = importlib.util.find_spec("PyQt5") is not None
 
 
 class SamplingTests(unittest.TestCase):
+    def test_straight_pressure_stroke_uses_fewer_bounded_segments(self) -> None:
+        points = [(10, 20, .2), (410, 20, .8)]
+
+        sampled = rendering.sample_stroke(points, smooth=False, pressure=.5)
+
+        self.assertEqual(len(sampled) - 1, 128)
+        self.assertEqual(sampled[0], (10, 20, .1))
+        self.assertEqual(sampled[-1], (410, 20, .4))
+        self.assertLessEqual(max(math.dist(first[:2], second[:2])
+                                 for first, second in zip(sampled, sampled[1:])), 4)
+        for horizontal, vertical, force in sampled:
+            self.assertEqual(vertical, 20)
+            self.assertAlmostEqual(force, .1 + (horizontal - 10) * .3 / 400)
+
+    def test_four_pixel_chords_fit_spatial_sample_budget(self) -> None:
+        points = [(0, 0), (64, 0)]
+
+        with patch.object(rendering, "MAX_SAMPLES", 17):
+            sampled = rendering.sample_stroke(points, smooth=False, pressure=.5)
+
+        self.assertEqual(len(sampled), 17)
+        self.assertEqual(sampled[-1], (64, 0, .5))
+
+    def test_short_tapers_preserve_interior_pressure(self) -> None:
+        for length in (.5, 2, 2.01, 3, 4):
+            for begin, finish in ((.5, 0), (0, .5), (.5, .5)):
+                with self.subTest(length=length, begin=begin, finish=finish):
+                    points = [(0, 0, .8), (length, 0, .8)]
+
+                    sampled = rendering.sample_stroke(points, smooth=False, pressure=.5,
+                                                       taper_start=begin, taper_end=finish)
+
+                    expected = [(0, 0, 0 if begin else .4)]
+                    if length > 2:
+                        expected.append((length / 2, 0, .4))
+                    expected.append((length, 0, 0 if finish else .4))
+                    self.assertEqual(sampled, expected)
+
+    def test_bezier_deviation_and_pressure_errors_remain_bounded(self) -> None:
+        points = [(0, 0, .2), (4 / 3, 8, 1), (8 / 3, -8, 0), (4, 0, .8)]
+
+        sampled = rendering.sample_stroke(points, curve="bezier", pressure=.5)
+
+        self.assertEqual(sampled[0], (0, 0, .1))
+        self.assertEqual(sampled[-1], (4, 0, .4))
+        for first, second in zip(sampled, sampled[1:]):
+            self.assertLessEqual(math.dist(first[:2], second[:2]), 4)
+            for fraction in (.25, .5, .75):
+                horizontal, vertical, force = (start + (end - start) * fraction
+                                                for start, end in zip(first, second))
+                along = horizontal / 4
+                self.assertLessEqual(abs(vertical - 24 * along * (1 - along) * (1 - 2 * along)), .2)
+                expected = .5 * (.2 * (1 - along)**3 + 3 * (1 - along)**2 * along + .8 * along**3)
+                self.assertLessEqual(abs(force - expected), .005 * .5)
+
     def test_pressure_multiplies_point_pressure(self) -> None:
         points = [(10, 20, .2), (20, 20, .8)]
 
@@ -42,7 +98,7 @@ class SamplingTests(unittest.TestCase):
         self.assertEqual(sampled[-1], (30, 20, 1))
         self.assertIn((20, 35, .5), sampled)
         self.assertLessEqual(max(math.dist(first[:2], second[:2])
-                                 for first, second in zip(sampled, sampled[1:])), 2)
+                                 for first, second in zip(sampled, sampled[1:])), 4)
 
     def test_curved_taper_ends_at_exact_zero_despite_arc_length_rounding(self) -> None:
         points = [(100, 200, .2), (120, 180, .8), (140, 200, .4)]
