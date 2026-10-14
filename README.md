@@ -12,13 +12,14 @@ MCP client -> krita-mcp (Go stdio binary) -> loopback HTTP -> Krita Python plugi
 ```
 
 - `cmd/krita-mcp/`: standalone Go entrypoint (`krita-mcp` for stdio MCP, `krita-mcp --version` for build info).
-- `internal/mcpserver/`: 29 `krita_` MCP tool registrations, schemas, and legacy string or structured JSON result formatting.
+- `internal/mcpserver/`: 31 `krita_` MCP tool registrations, schemas, and legacy string or structured JSON result formatting.
 - `internal/kritaclient/`: strict Go command/batch validation and single-attempt loopback `net/http` transport.
 - `krita-plugin/kritamcp/`: HTTP handoff and native painting on Krita's GUI thread,
   geometry preparation, generated polygon layers and selection masking, and preview export.
 
-All 15 original tool names and 14 extended tools (polygons, layers, selections,
-current-brush inspection, and batches) preserve their MCP schemas and wire contracts.
+All 15 original tool names and the previous 14 extended tools (polygons, layers,
+selections, current-brush inspection, and batches) preserve their MCP schemas and
+wire contracts. Two additional tools delete layers and merge layers down.
 External Python server modules (`server.py`, `krita_mcp`, `krita_client`, and
 `requirements.txt`) were intentionally removed in favor of the standalone Go binary.
 No model calls are made by the server, and no API keys are required.
@@ -28,8 +29,9 @@ No model calls are made by the server, and no API keys are required.
 End users who extract a prebuilt `krita-mcp_<VERSION>_<OS>_<ARCH>.tar.zst` release
 archive do not need external Python or Go installed. Extract the `krita-mcp`
 executable (`krita-mcp.exe` on Windows) and install the Krita plugin separately.
-No GitHub release has been published yet; until the first release is published,
-build the server from source with Go 1.25+ (tested with Go 1.26.1).
+A mutable development [snapshot release](https://github.com/AI-Trash/krita-mcp/releases/tag/snapshot)
+is available. Stable release publication is still pending. Building from source
+requires Go 1.25+ (tested with Go 1.26.1).
 
 Use a Krita build exposing native `Node.paintPath` and `Node.paintLine`. Those APIs
 were probed on macOS Krita 5.3.4.1 with Krita's bundled Python 3.13 (the plugin
@@ -102,7 +104,7 @@ For Claude Desktop or another stdio MCP client, pass the absolute executable pat
 
 The server communicates with the plugin using `POST /` and
 `{"action": "stroke", "params": {...}}`. `GET /health` and `GET /info` report
-plugin health/version and capabilities; the current base plugin version is `0.3.0`.
+plugin health/version and capabilities; the current base plugin version is `0.3.1`.
 The HTTP bridge rejects every request carrying an `Origin` header and requires
 `Content-Type: application/json` for command POSTs. Browser access is not supported.
 These restrictions do not authenticate callers: local processes remain
@@ -144,8 +146,10 @@ views of other documents are allowed.
 | `krita_gradient_polygon` | `points, color, gradient_end_color, gradient_type='linear', direction=0, smooth=True, feather=0, preserve_alpha=False` |
 | `krita_create_layer` | `name='Paint Layer', blending_mode='normal'`; creates and activates a paint layer |
 | `krita_set_layer_properties` | `layer_id=None, name=None, opacity=None, visible=None, blending_mode=None, preserve_alpha=None`; None properties unchanged |
-| `krita_list_layers` | Return `layers` with stable IDs and `active_layer_id` |
+| `krita_list_layers` | Return `layers` with UUIDs and `active_layer_id`; refresh IDs after merging |
 | `krita_set_active_layer` | `layer_id`: activate an existing layer |
+| `krita_delete_layer` | Required nonempty string `layer_id`: remove the identified layer and its contents; return `deleted_layer_id` and nullable `active_layer_id` |
+| `krita_merge_down` | Required nonempty string `layer_id`: merge into the layer immediately below; return a new `layer_id`/`active_layer_id` and the input `merged_layer_id` |
 | `krita_select_rect` | `x, y, width, height`: replace selection with rectangle |
 | `krita_select_ellipse` | `x, y, width, height`: replace selection with ellipse |
 | `krita_select_polygon` | `points, smooth=False`: replace selection with closed polygon |
@@ -172,6 +176,16 @@ any HTTP request: invalid top-level tool arguments return an MCP tool error
 (`isError: true`), while invalid batch child commands return a structured
 `{"error": "..."}` object without contacting Krita.
 
+Layer IDs are UUIDs returned by layer operations or `krita_list_layers`.
+Deleting the active layer selects an available fallback; `active_layer_id` is
+null if no active layer remains. Merging replaces layer identities with a new
+UUID and activates the merged layer. Use the returned `layer_id` or refresh
+`krita_list_layers` before addressing the merged layer again; the old UUIDs are
+no longer valid. Both tools require an explicit ID, reject extra arguments, and
+can be used as `delete_layer` and `merge_down` batch actions. A batch cannot
+substitute a previous result's new UUID into a later command: split dependent
+work into another call after receiving the merge result.
+
 ## Native Stroke and Polygon Semantics
 
 Stroke points are `[x,y]` or `[x,y,pressure]`, with at least two points. Scalar
@@ -187,7 +201,12 @@ use one native `paintPath`, including pressure triples whose pressure values are
 all 1. Nonunit scalar/point pressure or taper uses sampled native `paintLine`
 segments. This is **not a continuous human stroke**: segments reset brush/smudge
 state, may change spacing and alpha buildup, round sampled coordinates to
-integers, and are expected to produce multiple undo steps. Numeric `undo_steps`
+integers, and are expected to produce multiple undo steps. Sampled pressure
+chords are bounded to 4 pixels (previously 2); synchronization occurs every
+32 native calls plus a final flush, rather than after each segment. This reduces
+synchronization overhead while retaining independent native undo entries and
+integer-coordinate precision; it does not combine the segments into one undo
+step or provide fractional native pressure coordinates. Numeric `undo_steps`
 is an **expected, unverified count**, with `undo_steps_verified=False`; native
 no-ops can produce a different actual history count. Inspect `engine`, `mode`,
 `native_calls`, `undo_steps`, `undo_steps_verified`, and `fidelity_warning` in the result.
@@ -204,8 +223,10 @@ layer is created. There is no automatic merge or promise of preserving the
 current layer's alpha: `preserve_alpha=True` is rejected for generated operations.
 Active selection clips generated pixels; the target layer's pixels and identity
 are left unchanged. An entirely out-of-bounds polygon can return `changed=False`
-and `layer_id=None` instead of creating a layer. After attachment, the original
-target layer is restored as active.
+and `layer_id=None` instead of creating a layer. After attachment, the generated
+layer remains active, including within a batch. Creating layer A, generating G,
+then creating B places B above G, with G above A. Painting after generating G
+targets G until another layer is activated or created.
 
 Gradients accept `linear` or `radial`. Linear direction is degrees: 0 is
 left-to-right, 90 top-to-bottom. Radial gradients center on the polygon bounding
@@ -236,6 +257,13 @@ rollback, or automatic undo. On failure prior changes remain. Results include
 `completed_count`, `results`, `atomic=False`; failures additionally include
 `failing_index` and `failing_result`. Nested batches are forbidden. A failed
 pressure stroke itself may already have painted some native segments.
+
+Successful batches retain per-command results and their unique query data, but
+move `undo_steps_note` and `fidelity_warning` strings into a top-level
+`warnings` list. Warning strings appear once, in first-seen order; `warnings` is
+omitted when there are none. Failure results and single-command responses keep
+their original warning fields. Generated layers becoming active are expected
+batch context changes; unrelated document/view/layer changes still stop a batch.
 
 Only batch requests have **no HTTP read timeout**, so long native work can finish.
 Their connect and write timeouts stay finite (120 seconds).
@@ -336,9 +364,10 @@ Batch action names **omit** `krita_` and each entry includes `params`:
 
 ## Versioning and Releases
 
-The root [`version`](version) file holds a single-line stable SemVer base (`0.3.0`,
-without a `v` prefix or prerelease/build suffix). No GitHub release has been
-published yet.
+The root [`version`](version) file holds a single-line stable SemVer base (`0.3.1`,
+without a `v` prefix or prerelease/build suffix). The development
+[snapshot prerelease](https://github.com/AI-Trash/krita-mcp/releases/tag/snapshot)
+has been published; stable release publication is still pending.
 
 - **`main` (stable releases)**: Pushing to `main` publishes `v<VERSION>` as a
   non-prerelease using `andelf/nightly-release`, as in LavaFishing. Reusing a
@@ -355,7 +384,8 @@ published yet.
   UPX installation, plugin packaging, GoReleaser build, and release publication.
   There are no PR triggers or verification jobs. Each checks out the exact event
   SHA with full history and grants `contents: write` for publication.
-  These workflows have not yet been verified by an actual GitHub Actions publication.
+  Snapshot publication has produced the linked prerelease; the stable publication
+  path has not yet been verified by an actual stable release.
 - **Release artifacts**: The workflows and [`.goreleaser.yaml`](.goreleaser.yaml)
   use GoReleaser `v2.18.3` and UPX `v5.2.1` (installed via
   `jaxxstorm/action-install-gh-release`) to build six CGO-disabled server archives
