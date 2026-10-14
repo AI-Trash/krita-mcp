@@ -40,16 +40,19 @@ func TestCapturedReference_whenDiscoveryAndAllToolResults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != len(reference.Tools) {
+	if len(tools.Tools) != len(reference.Tools)+2 {
 		t.Fatalf("tools=%d", len(tools.Tools))
 	}
+	discovered := make(map[string]*mcp.Tool, len(tools.Tools))
 	for _, tool := range tools.Tools {
+		discovered[strings.TrimPrefix(tool.Name, "krita_")] = tool
+	}
+	for action, expected := range reference.Tools {
+		tool, exists := discovered[action]
+		if !exists {
+			t.Fatalf("missing historical tool krita_%s", action)
+		}
 		t.Run(tool.Name, func(t *testing.T) {
-			action := strings.TrimPrefix(tool.Name, "krita_")
-			expected, exists := reference.Tools[action]
-			if !exists {
-				t.Fatalf("unexpected tool %s", tool.Name)
-			}
 			assertSchema(t, tool.InputSchema, expected.InputSchema)
 			output, exists := reference.OutputSchemas[expected.Output]
 			if !exists {

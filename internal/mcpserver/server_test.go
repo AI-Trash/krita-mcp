@@ -8,7 +8,7 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-func TestStdio_whenBuiltBinary_all29ToolsRoundTrip(t *testing.T) {
+func TestStdio_whenBuiltBinary_all31ToolsRoundTrip(t *testing.T) {
 	plugin := newPlugin(t)
 	session := connectBinary(t, plugin, buildBinary(t))
 	info := session.InitializeResult().ServerInfo
@@ -19,7 +19,7 @@ func TestStdio_whenBuiltBinary_all29ToolsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(tools.Tools) != 29 {
+	if len(tools.Tools) != 31 {
 		t.Fatalf("tools=%d", len(tools.Tools))
 	}
 	for _, tool := range tools.Tools {

@@ -31,6 +31,7 @@ var toolArguments = map[string]json.RawMessage{
 	"gradient_polygon": json.RawMessage(`{"points":[[0,0],[20,0],[0,20]],"color":"#000000","gradient_end_color":"#ffffff","gradient_type":"radial"}`),
 	"create_layer":     json.RawMessage(`{}`), "set_layer_properties": json.RawMessage(`{"opacity":0,"visible":false}`),
 	"list_layers": json.RawMessage(`{}`), "set_active_layer": json.RawMessage(`{"layer_id":"layer-1"}`),
+	"delete_layer": json.RawMessage(`{"layer_id":"layer-1"}`), "merge_down": json.RawMessage(`{"layer_id":"layer-1"}`),
 	"select_rect":     json.RawMessage(`{"x":0,"y":0,"width":20,"height":30}`),
 	"select_ellipse":  json.RawMessage(`{"x":0,"y":0,"width":20,"height":30}`),
 	"select_polygon":  json.RawMessage(`{"points":[[0,0],[20,0],[0,20]]}`),
