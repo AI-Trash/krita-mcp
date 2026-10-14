@@ -202,6 +202,38 @@ class NodeDouble:
             self.document.pending_activation = node
         return True
 
+    def remove(self):
+        if self.parent is None:
+            return False
+        parent = self.parent
+        index = parent.children.index(self)
+        parent.children.remove(self)
+        self.parent = None
+        self.document.events.append(("remove", self.uid))
+        active = self.document.active
+        while active is not None and active != self:
+            active = active.parent
+        if active == self:
+            self.document.active = (parent.children[max(0, index - 1)] if parent.children else
+                                    parent if parent != self.document.root else None)
+        return True
+
+    def mergeDown(self):
+        if self.parent is None:
+            return None
+        parent = self.parent
+        index = parent.children.index(self)
+        if index == 0:
+            return None
+        lower = parent.children[index - 1]
+        merged = self.document.createNode("Merged", "paintlayer")
+        merged.parent = parent
+        parent.children[index - 1:index + 1] = [merged]
+        self.parent = lower.parent = None
+        self.document.active = merged
+        self.document.events.append(("merge", self.uid, lower.uid, merged.uid))
+        return None
+
     def setPixelData(self, pixels, x, y, width, height):
         if self.parent is not None:
             raise AssertionError("Attached raw write corrupts native history")
@@ -476,6 +508,127 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.node.calls[0][3], 0)
         self.assertEqual(self.node.calls[-1][4], 0)
 
+    def test_pressure_flushes_groups_of_32_before_restoring_brush(self):
+        flushes = []
+        native_wait = self.document.waitForDone
+        def wait():
+            flushes.append((len(self.node.calls), self.app.view.size, self.app.view.opacity, self.node.alpha))
+            native_wait()
+
+        with patch.object(self.document, "waitForDone", side_effect=wait):
+            result = self.run_command("stroke", points=[[0, 10], [300, 10]], pressure=.5, smooth=False,
+                                      size=40, opacity=.2, preserve_alpha=True)
+
+        calls = result["native_calls"]
+        self.assertGreater(calls, 64)
+        self.assertEqual([entry[0] for entry in flushes], [0, *range(32, calls + 1, 32), calls])
+        self.assertEqual(flushes[1:], [(count, 40, .2, True) for count, *_ in flushes[1:]])
+        self.assertEqual((self.app.view.size, self.app.view.opacity, self.node.alpha), (12, .6, False))
+
+    def test_pressure_wait_failure_flushes_queued_calls_and_restores_brush(self):
+        native_wait = self.document.waitForDone
+        flushed = []
+        def wait():
+            native_wait()
+            if self.document.waits == 2:
+                raise RuntimeError("flush failed")
+            if self.node.calls:
+                flushed.append((len(self.node.calls), self.app.view.size))
+
+        with patch.object(self.document, "waitForDone", side_effect=wait):
+            result = self.run_command("stroke", points=[[0, 10], [130, 10]], pressure=.5,
+                                      size=40, opacity=.2, preserve_alpha=True)
+
+        self.assertIn("error", result)
+        self.assertEqual((result["native_calls"], result["undo_steps"]), (32, 32))
+        self.assertEqual(flushed, [(32, 40)])
+        self.assertTrue(result["outcome_uncertain"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual((self.app.view.size, self.app.view.opacity, self.node.alpha), (12, .6, False))
+
+    def test_pressure_final_flush_failure_restores_all_settings(self):
+        native_wait = self.document.waitForDone
+        def wait():
+            native_wait()
+            if self.node.calls:
+                raise RuntimeError("final flush failed")
+
+        with patch.object(self.document, "waitForDone", side_effect=wait):
+            result = self.run_command("stroke", points=[[10, 10], [18, 10]], pressure=.5,
+                                      size=40, opacity=.2, color="red", preserve_alpha=True)
+
+        self.assertIn("error", result)
+        self.assertEqual(result["native_calls"], len(self.node.calls))
+        self.assertGreater(result["native_calls"], 0)
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual((self.app.view.size, self.app.view.opacity, self.node.alpha), (12, .6, False))
+        self.assertEqual(self.app.view.foreground, QColor("blue"))
+
+    def test_pressure_native_exception_flushes_prior_segments_without_retry(self):
+        native = self.node.paintLine
+        native_wait = self.document.waitForDone
+        flushed = []
+        def paint(*args):
+            if len(self.node.calls) == 3:
+                raise RuntimeError("line failed")
+            native(*args)
+        def wait():
+            native_wait()
+            if self.node.calls:
+                flushed.append((len(self.node.calls), self.app.view.size))
+
+        with patch.object(self.node, "paintLine", side_effect=paint), patch.object(self.document, "waitForDone", side_effect=wait):
+            result = self.run_command("stroke", points=[[0, 10], [130, 10]], pressure=.5, size=40)
+
+        self.assertEqual(result["native_calls"], 3)
+        self.assertEqual(len(self.node.calls), 3)
+        self.assertEqual(flushed, [(3, 40)])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(self.app.view.size, 12)
+
+    def test_pressure_focus_change_at_flush_stops_before_more_segments(self):
+        for change in ("document", "view", "layer", "extra_view"):
+            with self.subTest(change=change):
+                self.setUp()
+                other = NodeDouble(self.document, "other", "other")
+                native_wait = self.document.waitForDone
+                def wait():
+                    native_wait()
+                    if self.document.waits != 2:
+                        return
+                    if change == "document":
+                        self.app.document = DocumentDouble(self.app)
+                    elif change == "view":
+                        self.app.view = ViewDouble(self.document)
+                    elif change == "layer":
+                        self.document.active = other
+                    else:
+                        self.app.extra_views.append(ViewDouble(self.document))
+
+                with patch.object(self.document, "waitForDone", side_effect=wait):
+                    result = self.run_command("batch", commands=[{"action": "stroke", "params": {
+                        "points": [[0, 10], [130, 10]], "pressure": .5}}, {"action": "clear"}])
+
+                self.assertEqual(result["completed_count"], 0)
+                self.assertEqual(result["failing_result"]["native_calls"], 32)
+                self.assertEqual(len(self.node.calls), 32)
+                self.assertEqual(other.calls, [])
+
+    def test_pressure_focus_change_during_final_flush_is_reported(self):
+        native_wait = self.document.waitForDone
+        other = NodeDouble(self.document, "other", "other")
+        def wait():
+            native_wait()
+            if self.node.calls:
+                self.document.active = other
+
+        with patch.object(self.document, "waitForDone", side_effect=wait):
+            result = self.run_command("stroke", points=[[10, 10], [18, 10]], pressure=.5)
+
+        self.assertIn("error", result)
+        self.assertEqual(result["native_calls"], len(self.node.calls))
+        self.assertIs(self.document.active, other)
+
     def test_pressure_deadline_reports_completed_segments_and_restores_state(self):
         raw = {"action": "stroke", "params": {"points": [[10, 10], [18, 10]], "pressure": .5, "size": 40, "color": "red", "preserve_alpha": True}}
         checks = []
@@ -497,6 +650,12 @@ class CommandTests(unittest.TestCase):
 
         self.assertIn("error", result)
         self.assertEqual(self.node.calls, [])
+
+    def test_long_pressure_stroke_within_sample_budget_is_accepted(self):
+        result = self.run_command("stroke", points=[[0, 0], [3000, 0]], pressure=.5, smooth=False)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertLessEqual(result["native_calls"], commands.MAX_NATIVE_CALLS)
 
     def test_enormous_integer_is_a_command_error_not_overflow(self):
         with self.assertRaises(bridge.CommandError):
@@ -658,11 +817,11 @@ class CommandTests(unittest.TestCase):
 
     def test_batch_accepts_more_than_4096_aggregate_native_calls(self):
         stroke = {"action": "stroke", "params": {"points": [[0, 0], [1000, 0]], "pressure": .5}}
-        raw = {"action": "batch", "params": {"commands": [stroke] * 10}}
+        raw = {"action": "batch", "params": {"commands": [stroke] * 12}}
 
         result = self.executor.execute(raw)
 
-        self.assertEqual(result["completed_count"], 10)
+        self.assertEqual(result["completed_count"], 12)
         self.assertGreater(len(self.node.calls), 4096)
 
     def test_batch_validates_last_action_before_first_mutation(self):
@@ -681,6 +840,64 @@ class CommandTests(unittest.TestCase):
         self.assertEqual((result["completed_count"], result["failing_index"], len(result["results"])), (1, 1, 1))
         self.assertFalse(result["retry_safe"])
         self.assertEqual(self.app.view.foreground.getRgb(), (255, 0, 0, 255))
+
+    def test_successful_batch_collects_warnings_once_for_40_strokes(self):
+        stroke = {"action": "stroke", "params": {"points": [[10, 10], [18, 10]], "pressure": .5}}
+        single = self.executor.execute(stroke)
+        queue, request = self.queued_batch([stroke] * 40)
+        queue.process_one(self.executor.begin)
+        batch = request.batch
+        for _ in range(39):
+            queue.process_one(self.executor.begin)
+
+        result = request.wait()
+
+        self.assertEqual(result["completed_count"], 40)
+        self.assertEqual(result["warnings"], [single["undo_steps_note"], single["fidelity_warning"]])
+        self.assertEqual(len(result["results"]), 40)
+        for child in result["results"]:
+            self.assertEqual(child, {key: value for key, value in single.items()
+                                     if key not in ("undo_steps_note", "fidelity_warning")})
+        self.assertTrue(all(child["undo_steps_note"] == single["undo_steps_note"]
+                            and child["fidelity_warning"] == single["fidelity_warning"]
+                            for child in batch.results))
+
+    def test_successful_mixed_batch_preserves_all_other_child_data(self):
+        child_results = [
+            {"status": "ok", "path": "one.png", "diff_path": "diff.png", "undo_steps_note": "first", "fidelity_warning": "second"},
+            {"status": "ok", "color": "#123456", "r": 18, "g": 52, "b": 86, "a": 255},
+            {"status": "ok", "layer_id": "new-id", "active_layer_id": "new-id", "fidelity_warning": "third", "undo_steps_note": "first"},
+            {"status": "ok", "native_calls": 3, "undo_steps": 3, "undo_steps_note": "", "fidelity_warning": None}]
+
+        with patch.object(self.executor, "dispatch", side_effect=child_results):
+            result = self.run_command("batch", commands=[{"action": "get_current_brush"}] * 4)
+
+        self.assertEqual(result["warnings"], ["first", "second", "third"])
+        expected = [{key: value for key, value in child.items()
+                     if key not in ("undo_steps_note", "fidelity_warning") or not value}
+                    for child in child_results]
+        self.assertEqual(result["results"], expected)
+        self.assertEqual(child_results[0]["undo_steps_note"], "first")
+
+    def test_batch_failure_retains_full_completed_and_failing_warnings(self):
+        stroke = {"action": "stroke", "params": {"points": [[10, 10], [18, 10]], "pressure": .5}}
+        queue, request = self.queued_batch([stroke, stroke])
+        queue.process_one(self.executor.begin)
+        completed = dict(request.batch.results[0])
+        self.node.fail_paint = True
+
+        queue.process_one(self.executor.begin)
+
+        result = request.wait()
+        self.assertEqual(result["results"], [completed])
+        self.assertTrue(result["failing_result"]["fidelity_warning"])
+        self.assertEqual(result["failing_result"]["undo_steps_note"], completed["undo_steps_note"])
+        self.assertNotIn("warnings", result)
+
+    def test_warning_free_batch_omits_warnings(self):
+        result = self.run_command("batch", commands=[{"action": "get_current_brush"}])
+
+        self.assertNotIn("warnings", result)
 
     def test_unexpected_runtime_exception_still_preserves_batch_prefix(self):
         raw = {"action": "batch", "params": {"commands": [{"action": "set_color", "params": {"color": "red"}}, {"action": "get_current_brush"}]}}
@@ -1007,7 +1224,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.document.nodes, [])
 
     def test_generated_gradient_writes_detached_then_attaches_above_target(self):
-        before = (self.node.uid, self.node.pixels, self.document.active)
+        before = (self.node.uid, self.node.pixels)
 
         result = self.run_command("gradient_polygon", points=[[10, 10], [20, 10], [20, 20]], color="red", gradient_end_color="blue", smooth=False)
 
@@ -1019,7 +1236,8 @@ class CommandTests(unittest.TestCase):
                                                    ("detached_write", generated.uid),
                                                    ("convert", generated.uid, STANDARD_SRGB, STANDARD_SRGB, True),
                                                    ("attach", generated.uid, "target")])
-        self.assertEqual((self.node.uid, self.node.pixels, self.document.active), before)
+        self.assertEqual((self.node.uid, self.node.pixels), before)
+        self.assertIs(self.document.active, generated)
 
     def test_generated_feather_is_independent_layer(self):
         result = self.run_command("fill_polygon", points=[[10, 10], [20, 10], [20, 20]], feather=3)
@@ -1028,7 +1246,7 @@ class CommandTests(unittest.TestCase):
         self.assertEqual(self.node.calls, [])
         self.assertEqual(len(self.document.nodes), 1)
 
-    def test_generated_autoactivation_restores_target_for_batch_preview_and_stroke(self):
+    def test_generated_activation_targets_batch_preview_and_stroke(self):
         preview = ModuleType(PACKAGE + ".preview")
         preview_targets = []
         def export_preview(document, filename, **kwargs):
@@ -1046,29 +1264,45 @@ class CommandTests(unittest.TestCase):
                 queue.process_one(self.executor.begin)
 
         self.assertEqual(request.wait()["completed_count"], 3)
-        self.assertEqual(preview_targets, [self.node])
-        self.assertIs(self.document.active, self.node)
-        self.assertEqual(len(self.node.calls), 1)
-        self.assertEqual(self.document.nodes[0].calls, [])
+        generated = self.document.nodes[0]
+        self.assertEqual(preview_targets, [generated])
+        self.assertIs(self.document.active, generated)
+        self.assertEqual(self.node.calls, [])
+        self.assertEqual(len(generated.calls), 1)
 
-    def test_standalone_generated_autoactivation_restores_original_target_after_wait(self):
-        with patch.object(self.document, "setActiveNode", wraps=self.document.setActiveNode) as activate:
-            result = self.run_command("gradient_polygon", points=[[10, 10], [20, 10], [20, 20]],
-                                      color="red", gradient_end_color="blue")
-
-        self.assertEqual(result["status"], "ok")
-        activate.assert_called_once_with(self.node)
-        self.assertIs(self.document.active, self.node)
-
-    def test_generated_leaves_already_active_target_without_reactivation(self):
-        self.document.auto_activate = False
+    def test_standalone_generated_keeps_native_autoactivation_after_wait(self):
         with patch.object(self.document, "setActiveNode", wraps=self.document.setActiveNode) as activate:
             result = self.run_command("gradient_polygon", points=[[10, 10], [20, 10], [20, 20]],
                                       color="red", gradient_end_color="blue")
 
         self.assertEqual(result["status"], "ok")
         activate.assert_not_called()
-        self.assertIs(self.document.active, self.node)
+        self.assertIs(self.document.active, self.document.nodes[0])
+
+    def test_generated_explicitly_activates_when_attachment_does_not(self):
+        self.document.auto_activate = False
+        with patch.object(self.document, "setActiveNode", wraps=self.document.setActiveNode) as activate:
+            result = self.run_command("gradient_polygon", points=[[10, 10], [20, 10], [20, 20]],
+                                      color="red", gradient_end_color="blue")
+
+        self.assertEqual(result["status"], "ok")
+        activate.assert_called_once_with(self.document.nodes[0])
+        self.assertIs(self.document.active, self.document.nodes[0])
+
+    def test_create_after_generated_places_b_above_g_above_a(self):
+        children = [{"action": "gradient_polygon", "params": {"points": [[10, 10], [20, 10], [20, 20]],
+                     "color": "red", "gradient_end_color": "blue"}},
+                    {"action": "create_layer", "params": {"name": "B"}},
+                    {"action": "stroke", "params": {"points": [[10, 10], [20, 10]]}}]
+
+        result = self.run_command("batch", commands=children)
+
+        generated, upper = self.document.nodes
+        self.assertEqual(result["completed_count"], 3)
+        self.assertEqual(self.document.root.children, [self.node, generated, upper])
+        self.assertIs(self.document.active, upper)
+        self.assertEqual(len(upper.calls), 1)
+        self.assertEqual((self.node.calls, generated.calls), ([], []))
 
     def test_standalone_attachment_view_switch_does_not_restore_target(self):
         native_wait = self.document.waitForDone
@@ -1175,7 +1409,7 @@ class CommandTests(unittest.TestCase):
                                        color=(64, 128, 192, 255), gradient_end_color=(192, 128, 64, 255))
         expected = bytes(value if index % 4 == 3 else round((value / 255) ** 2 * 255)
                          for index, value in enumerate(patch[4]))
-        before = (self.node.pixels, self.node.profile, self.document.active)
+        before = (self.node.pixels, self.node.profile)
 
         result = self.run_command("gradient_polygon", points=points, color="#4080c0",
                                   gradient_end_color="#c08040", smooth=False)
@@ -1189,7 +1423,8 @@ class CommandTests(unittest.TestCase):
                                                    ("detached_write", generated.uid),
                                                    ("convert", generated.uid, STANDARD_SRGB, LINEAR_PROFILE, True),
                                                    ("attach", generated.uid, "target")])
-        self.assertEqual((self.node.pixels, self.node.profile, self.document.active), before)
+        self.assertEqual((self.node.pixels, self.node.profile), before)
+        self.assertIs(self.document.active, generated)
 
     def test_feathered_foreground_copies_original_space_without_display_conversion(self):
         self.document.profile = LINEAR_PROFILE
@@ -1391,6 +1626,221 @@ class CommandTests(unittest.TestCase):
         self.assertTrue(changed["preserve_alpha"])
         self.assertEqual(self.run_command("set_active_layer", layer_id="target")["layer_id"], "target")
         self.assertEqual(len(self.run_command("list_layers")["layers"]), 2)
+
+    def test_layer_operations_require_explicit_valid_id_and_known_params(self):
+        for action in ("delete_layer", "merge_down"):
+            for params in ({}, {"layer_id": None}, {"layer_id": ""}, {"layer_id": 7},
+                           {"layer_id": "target", "unknown": True}):
+                with self.subTest(action=action, params=params):
+                    result = self.run_command(action, **params)
+
+                    self.assertIn("error", result)
+                    self.assertFalse(result["execution_started"])
+        self.assertEqual(self.document.events, [])
+
+    def test_layer_operations_refuse_root_missing_detached_and_locks(self):
+        for action in ("delete_layer", "merge_down"):
+            for invalid in ("root", "missing", "detached", "node_lock", "parent_lock"):
+                with self.subTest(action=action, invalid=invalid):
+                    self.setUp()
+                    upper = self.document.createNode("upper", "paintlayer")
+                    self.document.root.addChildNode(upper, self.node)
+                    self.document.waitForDone()
+                    self.document.events.clear()
+                    layer_id = upper.uid
+                    if invalid in ("root", "missing"):
+                        layer_id = invalid
+                    elif invalid == "detached":
+                        with patch.object(self.executor, "layer", return_value=self.document.createNode("detached", "paintlayer")):
+                            result = self.run_command(action, layer_id=layer_id)
+                    elif invalid == "node_lock":
+                        upper.lock = True
+                    else:
+                        self.document.root.lock = True
+                    if invalid != "detached":
+                        result = self.run_command(action, layer_id=layer_id)
+
+                    self.assertIn("error", result)
+                    self.assertFalse(result["execution_started"])
+                    self.assertEqual(self.document.events, [])
+
+    def test_delete_active_layer_reacquires_survivor_for_batch_stroke(self):
+        upper = self.run_command("create_layer")["layer_id"]
+        children = [{"action": "delete_layer", "params": {"layer_id": upper}},
+                    {"action": "stroke", "params": {"points": [[10, 10], [20, 10]]}}]
+
+        result = self.run_command("batch", commands=children)
+
+        self.assertEqual(result["completed_count"], 2)
+        self.assertEqual(result["results"][0], {"status": "ok", "deleted_layer_id": upper, "active_layer_id": "target"})
+        self.assertIs(self.document.active, self.node)
+        self.assertEqual(self.document.root.children, [self.node])
+        self.assertEqual(len(self.node.calls), 1)
+        self.assertIsNone(self.document.nodes[0].parent)
+
+    def test_delete_inactive_layer_keeps_existing_focus(self):
+        upper_id = self.run_command("create_layer")["layer_id"]
+        upper = self.document.active
+
+        result = self.run_command("delete_layer", layer_id="target")
+
+        self.assertEqual(result, {"status": "ok", "deleted_layer_id": "target", "active_layer_id": upper_id})
+        self.assertIs(self.document.active, upper)
+        self.assertEqual(self.document.root.children, [upper])
+
+    def test_delete_last_layer_returns_null_active_and_allows_batch_query(self):
+        result = self.run_command("batch", commands=[{"action": "delete_layer", "params": {"layer_id": "target"}},
+                                                    {"action": "list_layers"}])
+
+        self.assertEqual(result["completed_count"], 2)
+        self.assertEqual(result["results"][0], {"status": "ok", "deleted_layer_id": "target", "active_layer_id": None})
+        self.assertEqual(result["results"][1]["layers"], [])
+        self.assertIsNone(self.document.active)
+
+    def test_delete_group_with_active_child_selects_attached_sibling(self):
+        group = self.document.createNode("group", "grouplayer")
+        self.document.root.addChildNode(group, self.node)
+        child = self.document.createNode("child", "paintlayer")
+        group.addChildNode(child, None)
+        self.document.waitForDone()
+
+        result = self.run_command("delete_layer", layer_id=group.uid)
+
+        self.assertEqual(result["active_layer_id"], "target")
+        self.assertIs(self.document.active, self.node)
+        self.assertEqual(self.document.root.children, [self.node])
+
+    def test_delete_false_result_is_not_success(self):
+        with patch.object(self.node, "remove", return_value=False):
+            result = self.run_command("delete_layer", layer_id="target")
+
+        self.assertIn("error", result)
+        self.assertTrue(result["outcome_uncertain"])
+        self.assertFalse(result["retry_safe"])
+        self.assertEqual(self.document.root.children, [self.node])
+
+    def test_merge_none_result_reacquires_new_uuid_for_batch_stroke(self):
+        upper_id = self.run_command("create_layer")["layer_id"]
+        self.document.active = self.node
+
+        result = self.run_command("batch", commands=[{"action": "merge_down", "params": {"layer_id": upper_id}},
+                                                    {"action": "stroke", "params": {"points": [[10, 10], [20, 10]]}}])
+
+        merged = self.document.nodes[-1]
+        self.assertEqual(result["completed_count"], 2)
+        self.assertEqual(result["results"][0]["merged_layer_id"], upper_id)
+        self.assertEqual(result["results"][0]["layer_id"], merged.uid)
+        self.assertEqual(result["results"][0]["active_layer_id"], merged.uid)
+        self.assertNotIn(merged.uid, (upper_id, "target"))
+        self.assertEqual(self.document.root.children, [merged])
+        self.assertIs(self.document.active, merged)
+        self.assertEqual(len(merged.calls), 1)
+        self.assertEqual(self.document.events[-1][0], "merge")
+
+    def test_merge_handles_attached_or_stale_returned_wrapper(self):
+        for returned_attached in (True, False):
+            with self.subTest(returned_attached=returned_attached):
+                self.setUp()
+                self.run_command("create_layer")
+                upper = self.document.active
+                native = upper.mergeDown
+                def merge():
+                    native()
+                    return self.document.active if returned_attached else upper
+
+                with patch.object(upper, "mergeDown", side_effect=merge):
+                    result = self.run_command("merge_down", layer_id=upper.uid)
+
+                self.assertEqual(result["status"], "ok")
+                self.assertEqual(result["layer_id"], self.document.active.uid)
+                self.assertEqual(self.document.root.children, [self.document.active])
+
+    def test_merge_refuses_bottom_or_locked_lower_sibling_before_selection(self):
+        for locked in (False, True):
+            with self.subTest(locked=locked):
+                self.setUp()
+                layer_id = "target"
+                if locked:
+                    layer_id = self.run_command("create_layer")["layer_id"]
+                    self.node.lock = True
+                self.document.active = self.node
+                self.document.events.clear()
+                with patch.object(self.document, "setActiveNode", wraps=self.document.setActiveNode) as activate:
+                    result = self.run_command("merge_down", layer_id=layer_id)
+
+                self.assertIn("error", result)
+                self.assertFalse(result["execution_started"])
+                self.assertEqual(self.document.events, [])
+                activate.assert_not_called()
+
+    def test_merge_noop_or_ambiguous_mutation_never_deletes_input_as_fallback(self):
+        for ambiguous in (False, True):
+            with self.subTest(ambiguous=ambiguous):
+                self.setUp()
+                self.run_command("create_layer")
+                upper = self.document.active
+                native = upper.mergeDown
+                def merge():
+                    if ambiguous:
+                        native()
+                        extra = self.document.createNode("unexpected", "paintlayer")
+                        self.document.root.addChildNode(extra, None)
+                    return None
+
+                with patch.object(upper, "mergeDown", side_effect=merge), patch.object(upper, "remove", wraps=upper.remove) as remove:
+                    result = self.run_command("merge_down", layer_id=upper.uid)
+
+                self.assertIn("error", result)
+                self.assertTrue(result["outcome_uncertain"])
+                self.assertFalse(result["retry_safe"])
+                remove.assert_not_called()
+                self.assertEqual(len(self.document.root.children), 2)
+
+    def test_layer_operation_external_focus_changes_stop_without_overwrite(self):
+        for action in ("delete_layer", "merge_down"):
+            for change in ("document", "view", "layer", "extra_view"):
+                with self.subTest(action=action, change=change):
+                    self.setUp()
+                    upper_id = self.run_command("create_layer")["layer_id"]
+                    upper = self.document.active
+                    spacer = self.document.createNode("spacer", "paintlayer")
+                    self.document.root.addChildNode(spacer, upper)
+                    other = self.document.createNode("other", "paintlayer")
+                    self.document.root.addChildNode(other, spacer)
+                    self.document.waitForDone()
+                    self.document.active = upper
+                    native_wait = self.document.waitForDone
+                    native = upper.remove if action == "delete_layer" else upper.mergeDown
+                    mutated = []
+                    def mutate():
+                        returned = native()
+                        mutated.append(True)
+                        return returned
+                    def wait():
+                        native_wait()
+                        if not mutated:
+                            return
+                        if change == "document":
+                            self.app.document = DocumentDouble(self.app)
+                        elif change == "view":
+                            self.app.view = ViewDouble(self.document)
+                        elif change == "layer":
+                            self.document.active = other
+                        else:
+                            self.app.extra_views.append(ViewDouble(self.document))
+                    method = "remove" if action == "delete_layer" else "mergeDown"
+                    queue, request = self.queued_batch([{"action": action, "params": {"layer_id": upper_id}}, {"action": "clear"}])
+                    with patch.object(upper, method, side_effect=mutate), patch.object(self.document, "waitForDone", side_effect=wait), patch.object(self.document, "setActiveNode", wraps=self.document.setActiveNode) as activate:
+                        queue.process_one(self.executor.begin)
+
+                    result = request.wait()
+                    self.assertEqual(result["completed_count"], 0)
+                    self.assertTrue(result["outcome_uncertain"])
+                    self.assertFalse(result["retry_safe"])
+                    self.assertEqual(activate.call_count, 1 if action == "merge_down" else 0)
+                    self.assertEqual(other.calls, [])
+                    if change == "layer":
+                        self.assertIs(self.document.active, other)
 
     def test_get_current_brush_and_persistent_opacity(self):
         self.run_command("set_brush", size=33, opacity=.25)
