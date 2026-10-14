@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .env
+/dist/
+/krita-mcp
+/krita-mcp.exe
+/.omo/
+.DS_Store
