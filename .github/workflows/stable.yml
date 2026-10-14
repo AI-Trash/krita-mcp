@@ -1,0 +1,70 @@
+name: stable
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: stable
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set Up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Extract Version
+        id: version
+        run: |
+          version=$(cat version)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "plugin_zip=$RUNNER_TEMP/krita-mcp-plugin_$version.zip" >> "$GITHUB_OUTPUT"
+      - name: Install UPX
+        uses: jaxxstorm/action-install-gh-release@v2.1.0
+        with:
+          repo: upx/upx
+          tag: v5.2.1
+          asset-name: upx
+          binaries-location: upx-5.2.1-amd64_linux
+      - name: Package Plugin ZIP
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          PLUGIN_ZIP: ${{ steps.version.outputs.plugin_zip }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/plugin/kritamcp"
+          cp LICENSE krita-plugin/kritamcp.desktop "$RUNNER_TEMP/plugin/"
+          cp krita-plugin/kritamcp/*.py "$RUNNER_TEMP/plugin/kritamcp/"
+          sed -i "s/^VERSION: Final = .*/VERSION: Final = \"$RELEASE_VERSION\"/" "$RUNNER_TEMP/plugin/kritamcp/bridge.py"
+          (cd "$RUNNER_TEMP/plugin" && zip -r "$PLUGIN_ZIP" .)
+      - name: Build Native Archives
+        uses: goreleaser/goreleaser-action@v7
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+          PLUGIN_ZIP: ${{ steps.version.outputs.plugin_zip }}
+        with:
+          version: v2.18.3
+          args: release --snapshot --clean --skip=publish
+      - name: Publish Stable Release
+        uses: andelf/nightly-release@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ steps.version.outputs.version }}
+          name: krita-mcp ${{ steps.version.outputs.version }}
+          prerelease: false
+          body: 'Version: ${{ steps.version.outputs.version }}. Source commit: ${{ github.sha }}.'
+          files: |
+            dist/*.tar.zst
+            ${{ steps.version.outputs.plugin_zip }}
+            dist/SHA256SUMS

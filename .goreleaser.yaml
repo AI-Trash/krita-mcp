@@ -1,0 +1,45 @@
+version: 2
+project_name: krita-mcp
+dist: dist
+
+builds:
+  - id: krita-mcp
+    main: ./cmd/krita-mcp
+    binary: krita-mcp
+    env:
+      - CGO_ENABLED=0
+    goos: [darwin, linux, windows]
+    goarch: [amd64, arm64]
+    flags: [-trimpath]
+    ldflags:
+      - -s -w -X main.version={{ .Version }} -X main.commit={{ .Commit }} -X main.date={{ .CommitDate }}
+    mod_timestamp: '{{ .CommitTimestamp }}'
+
+upx:
+  - enabled: true
+    ids: [krita-mcp]
+    goos: [linux, windows]
+    goarch: [amd64, arm64]
+    compress: best
+
+archives:
+  - formats: [tar.zst]
+    name_template: '{{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}'
+    files: [LICENSE, README.md, version]
+
+snapshot:
+  version_template: '{{ .Env.RELEASE_VERSION }}'
+
+checksum:
+  name_template: SHA256SUMS
+  algorithm: sha256
+  extra_files:
+    - glob: '{{ .Env.PLUGIN_ZIP }}'
+
+release:
+  target_commitish: '{{ .Commit }}'
+  extra_files:
+    - glob: '{{ .Env.PLUGIN_ZIP }}'
+
+changelog:
+  disable: true
