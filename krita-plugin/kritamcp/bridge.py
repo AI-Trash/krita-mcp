@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 
 Json: TypeAlias = str | int | float | bool | None | list["Json"] | dict[str, "Json"]
 Result: TypeAlias = dict[str, Json]
-VERSION: Final = "0.3.0"
+VERSION: Final = "0.3.1"
 MAX_PENDING: Final = 32
 
 
